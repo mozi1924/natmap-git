@@ -38,64 +38,53 @@ jobs:
       - name: Update pkgver and .SRCINFO
         id: update
         run: |
-          # 1. 修改当前目录权限，确保 builder 可以读写
+          pacman -S --noconfirm fakeroot
+
+          useradd -m builder
           chown -R builder:builder .
 
-          # 2. 切换到 builder 用户执行，并将当前路径($PWD)作为参数传递($1)
-          # 使用 'EOF' (带单引号) 防止外部 Shell 提前解析变量，保留给内部脚本处理
-          su builder -c "bash -e -s" << 'EOF' -- "$PWD"
-            BUILD_DIR="$1"
-            
-            # 进入工作目录
-            cd "$BUILD_DIR"
-            
-            # 【重要】告诉 git 这是一个安全目录，否则操作 git 会报错
-            git config --global --add safe.directory "$BUILD_DIR"
+          su builder -c "bash -e" << 'EOF'
+            set -e
 
-            # --- 下面是核心逻辑 ---
+            cd "$PWD"
 
-            # 下载源文件 (只会克隆 git 仓库到 src/ 目录)
-            makepkg --nobuild --source
+            # 让 git 不抱怨权限
+            git config --global --add safe.directory "$PWD"
 
-            # 加载 PKGBUILD 变量
+            # 只 clone source，不生成签名，不打包，不检查依赖
+            makepkg --nobuild --nodeps --nosign --nocheck
+
             source PKGBUILD
-            
-            # 进入源码目录获取版本号
-            # 注意：makepkg 会根据 source 数组中的 "pkgname::git+..." 将代码克隆到 src/pkgname
-            if [ -d "src/$pkgname" ]; then
-              cd "src/$pkgname"
-            else
-              echo "Error: Source directory src/$pkgname not found."
+
+            # 找到真正的 git 目录
+            GITDIR=$(find src -maxdepth 2 -type d -name ".git" | xargs dirname)
+            if [[ ! -d "$GITDIR" ]]; then
+              echo "No git source found in src/"
               exit 1
             fi
-            
-            # 提取新版本号
-            NEW_VER=$(git describe --long --tags | sed 's/^v//;s/-/r/;s/-/./g')
-            echo "Latest version from git: $NEW_VER"
-            
-            # 回到 PKGBUILD 所在目录
-            cd "$BUILD_DIR"
 
-            # 读取旧版本号
-            OLD_VER=$(grep "^pkgver=" PKGBUILD | cut -d'=' -f2)
-            
-            if [ "$OLD_VER" != "$NEW_VER" ]; then
-              # 更新 PKGBUILD
+            cd "$GITDIR"
+
+            # 获取版本号（提供 fallback）
+            NEW_VER=$(git describe --tags --long --always 2>/dev/null \
+              | sed 's/^v//;s/-/r/;s/-/./g')
+
+            [[ -z "$NEW_VER" ]] && NEW_VER="0.0.0.r0"
+
+            cd "$OLDPWD"
+
+            OLD_VER=$(grep "^pkgver=" PKGBUILD | cut -d= -f2)
+
+            if [[ "$OLD_VER" != "$NEW_VER" ]]; then
+              echo "Updating pkgver $OLD_VER → $NEW_VER"
               sed -i "s/^pkgver=.*/pkgver=$NEW_VER/" PKGBUILD
-              echo "Updated pkgver from $OLD_VER to $NEW_VER"
-              
-              # 更新 .SRCINFO
               makepkg --printsrcinfo > .SRCINFO
-              
-              # 创建一个标记文件，告诉外部脚本发生了更新
-              # (因为 builder 用户可能无法直接写入 GITHUB_OUTPUT)
               touch .aur_updated
             else
-              echo "Version has not changed."
+              echo "Version unchanged."
             fi
           EOF
 
-          # 3. 回到 root 上下文，检查标记文件并设置 Output
           if [ -f .aur_updated ]; then
             echo "UPDATED=true" >> $GITHUB_OUTPUT
             rm .aur_updated
