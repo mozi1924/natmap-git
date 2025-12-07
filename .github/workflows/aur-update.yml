@@ -1,16 +1,13 @@
 name: Update AUR Package
 
 on:
-  # 定时触发：每天 UTC 时间 0点 (北京时间 8点)
   schedule:
-    - cron: '0 0 * * *'
-  # 允许手动触发
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 jobs:
   update-aur:
     runs-on: ubuntu-latest
-    # 使用 Arch Linux 容器，包含构建工具
     container: archlinux:base-devel
 
     steps:
@@ -21,75 +18,36 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          # 更新系统并安装 git (makepkg 需要)
-          pacman -Syu --noconfirm git openssh
+          pacman -Syu --noconfirm git openssh fakeroot
 
-          # 修复 git 安全目录问题
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Prepare Builder User
-        # makepkg 不允许以 root 运行，我们需要创建一个 builder 用户
-        run: |
-          useradd -m builder
-          chown -R builder:builder .
-          # 给予 builder 用户无密码 sudo 权限 (如果构建过程中需要安装依赖)
-          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-
-      - name: Update pkgver and .SRCINFO
+      # ✨ 不需要手动计算 pkgver，交给 makepkg
+      - name: Run makepkg to update pkgver and .SRCINFO
         id: update
         run: |
-          pacman -S --noconfirm fakeroot
-
-          useradd -m builder
+          # makepkg 不允许用 root，因此创建 builder（若已经存在则忽略）
+          id -u builder &>/dev/null || useradd -m builder
           chown -R builder:builder .
 
-          su builder -c "bash -e" << 'EOF'
-            set -e
+          # 让 builder 运行 makepkg（生成新 pkgver 和 .SRCINFO）
+          su builder -c "
+            cd $PWD
+            makepkg --nobuild --noprepare --nodeps --nosign --nocheck
+            makepkg --printsrcinfo > .SRCINFO
+          "
 
-            cd "$PWD"
+          # 比较 pkgver 是否变化
+          OLD_VER=$(git show HEAD:PKGBUILD | grep '^pkgver=' | cut -d= -f2)
+          NEW_VER=$(grep '^pkgver=' PKGBUILD | cut -d= -f2)
 
-            # 让 git 不抱怨权限
-            git config --global --add safe.directory "$PWD"
+          echo \"Old: $OLD_VER\"
+          echo \"New: $NEW_VER\"
 
-            # 只 clone source，不生成签名，不打包，不检查依赖
-            makepkg --nobuild --nodeps --nosign --nocheck
-
-            source PKGBUILD
-
-            # 找到真正的 git 目录
-            GITDIR=$(find src -maxdepth 2 -type d -name ".git" | xargs dirname)
-            if [[ ! -d "$GITDIR" ]]; then
-              echo "No git source found in src/"
-              exit 1
-            fi
-
-            cd "$GITDIR"
-
-            # 获取版本号（提供 fallback）
-            NEW_VER=$(git describe --tags --long --always 2>/dev/null \
-              | sed 's/^v//;s/-/r/;s/-/./g')
-
-            [[ -z "$NEW_VER" ]] && NEW_VER="0.0.0.r0"
-
-            cd "$OLDPWD"
-
-            OLD_VER=$(grep "^pkgver=" PKGBUILD | cut -d= -f2)
-
-            if [[ "$OLD_VER" != "$NEW_VER" ]]; then
-              echo "Updating pkgver $OLD_VER → $NEW_VER"
-              sed -i "s/^pkgver=.*/pkgver=$NEW_VER/" PKGBUILD
-              makepkg --printsrcinfo > .SRCINFO
-              touch .aur_updated
-            else
-              echo "Version unchanged."
-            fi
-          EOF
-
-          if [ -f .aur_updated ]; then
-            echo "UPDATED=true" >> $GITHUB_OUTPUT
-            rm .aur_updated
+          if [ \"$OLD_VER\" != \"$NEW_VER\" ]; then
+            echo \"UPDATED=true\" >> $GITHUB_OUTPUT
           else
-            echo "UPDATED=false" >> $GITHUB_OUTPUT
+            echo \"UPDATED=false\" >> $GITHUB_OUTPUT
           fi
 
       - name: Setup SSH
@@ -98,40 +56,28 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.AUR_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          # 添加 AUR 的 host key 到 known_hosts
           ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
 
       - name: Push to AUR
         if: steps.update.outputs.UPDATED == 'true'
         run: |
-          # 配置 git 信息
-          git config --global user.name "${{ secrets.AUR_USERNAME || 'github-actions' }}"
-          git config --global user.email "${{ secrets.AUR_EMAIL || 'github-actions@github.com' }}"
+          git config --global user.name "${{ secrets.AUR_USERNAME }}"
+          git config --global user.email "${{ secrets.AUR_EMAIL }}"
 
-          # 克隆 AUR 仓库
-          # 注意：这里的仓库名必须和你的包名一致
-          git clone "ssh://aur@aur.archlinux.org/natmap-git.git" aur-repo
-
-          # 复制更新后的文件到 AUR 仓库目录
+          git clone ssh://aur@aur.archlinux.org/natmap-git.git aur-repo
           cp PKGBUILD .SRCINFO aur-repo/
 
-          # 提交并推送
           cd aur-repo
-          if [[ -n $(git status -s) ]]; then
-            git add PKGBUILD .SRCINFO
-            git commit -m "Update to version $(grep '^pkgver=' PKGBUILD | cut -d'=' -f2)"
-            git push origin master
-            echo "Successfully pushed to AUR."
-          else
-            echo "No changes to commit."
-          fi
-          
-      - name: Commit back to GitHub (Optional)
+
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to version $(grep '^pkgver=' PKGBUILD | cut -d= -f2)"
+          git push
+
+      - name: Commit back to GitHub
         if: steps.update.outputs.UPDATED == 'true'
         run: |
-          # 如果你也想把更新后的 PKGBUILD 同步回当前的 GitHub 仓库
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@github.com"
           git add PKGBUILD .SRCINFO
-          git commit -m "Auto update pkgver" || echo "Nothing to commit"
+          git commit -m "Auto update pkgver"
           git push
