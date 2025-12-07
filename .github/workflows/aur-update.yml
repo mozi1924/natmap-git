@@ -38,39 +38,70 @@ jobs:
       - name: Update pkgver and .SRCINFO
         id: update
         run: |
-          # 切换到 builder 用户执行更新逻辑
-          su builder -c "bash -e" << 'EOF'
-            # 1. 下载源文件 (只会克隆 git 仓库，不会构建)
+          # 1. 修改当前目录权限，确保 builder 可以读写
+          chown -R builder:builder .
+
+          # 2. 切换到 builder 用户执行，并将当前路径($PWD)作为参数传递($1)
+          # 使用 'EOF' (带单引号) 防止外部 Shell 提前解析变量，保留给内部脚本处理
+          su builder -c "bash -e -s" << 'EOF' -- "$PWD"
+            BUILD_DIR="$1"
+            
+            # 进入工作目录
+            cd "$BUILD_DIR"
+            
+            # 【重要】告诉 git 这是一个安全目录，否则操作 git 会报错
+            git config --global --add safe.directory "$BUILD_DIR"
+
+            # --- 下面是核心逻辑 ---
+
+            # 下载源文件 (只会克隆 git 仓库到 src/ 目录)
             makepkg --nobuild --source
 
-            # 2. 手动执行 PKGBUILD 中的 pkgver() 逻辑来获取最新版本号
-            # 注意：这里我们模拟进入 src 目录
+            # 加载 PKGBUILD 变量
             source PKGBUILD
-            cd src/natmap-git
             
-            # 提取版本号 (使用 PKGBUILD 中定义的逻辑)
+            # 进入源码目录获取版本号
+            # 注意：makepkg 会根据 source 数组中的 "pkgname::git+..." 将代码克隆到 src/pkgname
+            if [ -d "src/$pkgname" ]; then
+              cd "src/$pkgname"
+            else
+              echo "Error: Source directory src/$pkgname not found."
+              exit 1
+            fi
+            
+            # 提取新版本号
             NEW_VER=$(git describe --long --tags | sed 's/^v//;s/-/r/;s/-/./g')
-            echo "Latest version: $NEW_VER"
-            cd ../..
+            echo "Latest version from git: $NEW_VER"
+            
+            # 回到 PKGBUILD 所在目录
+            cd "$BUILD_DIR"
 
-            # 3. 使用 sed 更新 PKGBUILD 文件中的 pkgver
-            # 我们读取当前文件的 pkgver，如果不同则替换
+            # 读取旧版本号
             OLD_VER=$(grep "^pkgver=" PKGBUILD | cut -d'=' -f2)
             
             if [ "$OLD_VER" != "$NEW_VER" ]; then
+              # 更新 PKGBUILD
               sed -i "s/^pkgver=.*/pkgver=$NEW_VER/" PKGBUILD
               echo "Updated pkgver from $OLD_VER to $NEW_VER"
               
-              # 4. 重新生成 .SRCINFO (AUR 必须)
+              # 更新 .SRCINFO
               makepkg --printsrcinfo > .SRCINFO
               
-              # 标记发生了更新，供后续步骤使用
-              echo "UPDATED=true" >> $GITHUB_OUTPUT
+              # 创建一个标记文件，告诉外部脚本发生了更新
+              # (因为 builder 用户可能无法直接写入 GITHUB_OUTPUT)
+              touch .aur_updated
             else
               echo "Version has not changed."
-              echo "UPDATED=false" >> $GITHUB_OUTPUT
             fi
           EOF
+
+          # 3. 回到 root 上下文，检查标记文件并设置 Output
+          if [ -f .aur_updated ]; then
+            echo "UPDATED=true" >> $GITHUB_OUTPUT
+            rm .aur_updated
+          else
+            echo "UPDATED=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Setup SSH
         if: steps.update.outputs.UPDATED == 'true'
