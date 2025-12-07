@@ -1,0 +1,103 @@
+name: Update AUR Stable Package
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # 每天检查一次
+  workflow_dispatch:
+
+jobs:
+  update-natmap-stable:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - name: Install Dependencies
+        run: |
+          pacman -Syu --noconfirm git openssh
+
+      - name: Setup Builder User
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+      - name: Configure SSH
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          mkdir -p /root/.ssh
+          eval $(ssh-agent -s)
+          echo "$AUR_SSH_KEY" > /root/.ssh/aur_key
+          chmod 600 /root/.ssh/aur_key
+          echo "Host aur.archlinux.org" >> /root/.ssh/config
+          echo "  IdentityFile /root/.ssh/aur_key" >> /root/.ssh/config
+          echo "  User aur" >> /root/.ssh/config
+          ssh-keyscan aur.archlinux.org >> /root/.ssh/known_hosts
+          
+          # 复制配置给 builder
+          cp -r /root/.ssh /home/builder/.ssh
+          chown -R builder:builder /home/builder/.ssh
+
+      - name: Clone AUR Repository
+        run: |
+          # 注意：这里改为 natmap.git (如果不带 -git 后缀的话)
+          # 如果你的仓库名还是 natmap-git 但内容是稳定版，请保持原样
+          git clone ssh://aur@aur.archlinux.org/natmap.git workspace
+          chown -R builder:builder workspace
+
+      - name: Check Upstream and Update
+        working-directory: ./workspace
+        run: |
+          # 1. 配置 Git
+          git config --global user.name "${{ secrets.AUR_USERNAME }}"
+          git config --global user.email "${{ secrets.AUR_EMAIL }}"
+          git config --global --add safe.directory $(pwd)
+
+          # 2. 获取上游最新 Tag
+          echo "Checking upstream tags..."
+          # git ls-remote 列出远程 tag
+          # sort -V 按照版本号排序 (v1.10 比 v1.2 大)
+          # tail -n1 取最后一个
+          LATEST_TAG_REF=$(git ls-remote --tags --refs --sort='v:refname' https://github.com/heiher/natmap.git | tail -n1 | awk '{print $2}')
+          
+          # 处理字符串：refs/tags/v20240822 -> 20240822
+          # 去掉 refs/tags/
+          TAG_NAME=${LATEST_TAG_REF#refs/tags/}
+          # 去掉开头的 v (如果上游 tag 是 v2024... 格式，Arch通常要把 v 去掉)
+          NEW_VER=${TAG_NAME#v}
+
+          echo "Latest upstream version: $NEW_VER"
+
+          # 3. 获取本地当前版本
+          OLD_VER=$(grep "^pkgver=" PKGBUILD | cut -d= -f2)
+          echo "Current AUR version: $OLD_VER"
+
+          # 4. 对比版本
+          if [ "$NEW_VER" == "$OLD_VER" ]; then
+            echo "Version match. No update needed."
+            exit 0
+          fi
+
+          echo "New version found! Updating..."
+
+          # 5. 修改 PKGBUILD
+          # 更新 pkgver
+          sed -i "s/^pkgver=.*/pkgver=$NEW_VER/" PKGBUILD
+          # 重置 pkgrel 为 1
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+
+          # 6. 生成 .SRCINFO
+          # 这步很重要：makepkg 会解析新修改的 PKGBUILD
+          # 因为 source 写的是 git+...#tag=v${pkgver}，它会验证这个 tag 是否存在
+          su builder -c "makepkg --printsrcinfo > .SRCINFO"
+
+          # 7. 提交并推送
+          # 再次检查是否有文件变化 (双重保险)
+          if ! git diff --exit-code PKGBUILD .SRCINFO; then
+             git add PKGBUILD .SRCINFO
+             git commit -m "upgpkg: natmap $NEW_VER"
+             echo "Pushing to AUR..."
+             git push origin master
+          else
+             echo "Something weird happened. Version changed but git sees no diff."
+          fi
