@@ -2,25 +2,21 @@ name: Update AUR Package
 
 on:
   schedule:
-    # 每天国际标准时间 0点 (北京时间 8点) 运行一次
     - cron: '0 0 * * *'
-  workflow_dispatch: # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   update-natmap:
     runs-on: ubuntu-latest
-    # 使用 Arch Linux 容器，包含了 makepkg 等必要工具
     container:
       image: archlinux:base-devel
 
     steps:
       - name: Install Dependencies
         run: |
-          # 更新系统并安装 git 和 openssh
           pacman -Syu --noconfirm git openssh
 
       - name: Setup Builder User
-        # makepkg 不允许以 root 运行，我们需要创建一个 builder 用户
         run: |
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
@@ -30,87 +26,59 @@ jobs:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
         run: |
           mkdir -p /root/.ssh
-          # 启动 ssh-agent 并添加密钥
           eval $(ssh-agent -s)
           echo "$AUR_SSH_KEY" > /root/.ssh/aur_key
           chmod 600 /root/.ssh/aur_key
-          
-          # 配置 SSH 使用该密钥访问 AUR
           echo "Host aur.archlinux.org" >> /root/.ssh/config
           echo "  IdentityFile /root/.ssh/aur_key" >> /root/.ssh/config
           echo "  User aur" >> /root/.ssh/config
-          
-          # 添加 AUR 的主机指纹
           ssh-keyscan aur.archlinux.org >> /root/.ssh/known_hosts
           
-          # 复制 SSH配置给 builder 用户 (因为后续部分操作可能需要)
+          # 复制 SSH 配置给 builder (以此支持 makepkg 拉取 git 源码)
           cp -r /root/.ssh /home/builder/.ssh
           chown -R builder:builder /home/builder/.ssh
 
       - name: Clone AUR Repository
         run: |
-          # 克隆 AUR 仓库
           git clone ssh://aur@aur.archlinux.org/natmap-git.git workspace
-          # 将工作目录权限移交给 builder 用户
           chown -R builder:builder workspace
 
-      - name: Update PKGBUILD and .SRCINFO
+      - name: Update and Push
         working-directory: ./workspace
         run: |
-          # 配置 git 信息 (用于提交)
+          # 1. 配置 Git 提交人信息
           git config --global user.name "${{ secrets.AUR_USERNAME }}"
           git config --global user.email "${{ secrets.AUR_EMAIL }}"
-          
-          # 标记当前目录安全
           git config --global --add safe.directory $(pwd)
 
-          echo "Fetching upstream changes..."
-          # 修正点：去掉 --source，只使用 --nobuild 来下载并解压源码
+          echo "Starting update process..."
+
+          # 2. 运行 makepkg
+          # --nobuild: 不编译，只下载源文件
+          # 关键点：makepkg 会自动执行 PKGBUILD 中的 pkgver() 函数
+          # 并直接修改 PKGBUILD 文件中的 pkgver 变量值
           su builder -c "makepkg --nobuild"
 
-          echo "Calculating new version..."
-          # 修正点：使用 builder 用户进入目录执行 git describe，避免 root/builder 权限导致的 git safe directory 报错
-          # 注意：路径 src/natmap-git 是由 PKGBUILD 中的 source 数组决定的
-          NEW_VER=$(su builder -c "cd src/natmap-git && git describe --long --tags | sed 's/^v//;s/-/r/;s/-/./g'")
-          
-          echo "New version detected: $NEW_VER"
-          
-          # 获取旧版本号
-          OLD_VER=$(grep "^pkgver=" PKGBUILD | cut -d= -f2)
-          
-          if [ "$NEW_VER" == "$OLD_VER" ]; then
-            echo "Version has not changed. Exiting."
-            echo "UPDATED=false" >> $GITHUB_ENV
-            exit 0
-          fi
-          
-          echo "Updating PKGBUILD..."
-          # 更新 PKGBUILD 中的 pkgver
-          sed -i "s/^pkgver=.*/pkgver=$NEW_VER/" PKGBUILD
-          
-          # 更新 pkgrel 为 1
-          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-
-          echo "Generating .SRCINFO..."
-          # 重新生成 .SRCINFO
+          # 3. 重新生成 .SRCINFO
+          # 因为 PKGBUILD 已经被上一步修改了，这里生成的 SRCINFO 也是最新的
           su builder -c "makepkg --printsrcinfo > .SRCINFO"
-          
-          echo "UPDATED=true" >> $GITHUB_ENV
 
-      - name: Push to AUR
-        working-directory: ./workspace
-        if: env.UPDATED == 'true'
-        run: |
-          # 再次配置 git (以防环境切换丢失)
-          git config user.name "${{ secrets.AUR_USERNAME }}"
-          git config user.email "${{ secrets.AUR_EMAIL }}"
-          
-          NEW_VER=$(grep "^pkgver=" PKGBUILD | cut -d= -f2)
-          
-          git add PKGBUILD .SRCINFO
-          git commit -m "upgpkg: natmap-git $NEW_VER"
-          
-          echo "Pushing changes to AUR..."
-          # 这里需要指明私钥，或者确保之前 SSH 配置对当前环境生效
-          # 由于我们在 root 下运行 git push，使用的是 /root/.ssh/config
-          git push origin master
+          # 4. 利用 Git 检测变化
+          # git diff --exit-code 在没有变化时返回 0，有变化时返回 1
+          # 我们使用 ! 取反：如果有变化则执行代码块
+          if ! git diff --exit-code PKGBUILD .SRCINFO; then
+            echo "Changes detected."
+            
+            # 读取新版本号用于 Commit 信息
+            # 此时 PKGBUILD 已经是被 makepkg 修改过的新文件
+            NEW_VER=$(grep "^pkgver=" PKGBUILD | cut -d= -f2)
+            
+            # 提交并推送
+            git add PKGBUILD .SRCINFO
+            git commit -m "upgpkg: natmap-git $NEW_VER"
+            
+            echo "Pushing to AUR..."
+            git push origin master
+          else
+            echo "No changes detected in PKGBUILD or .SRCINFO. Nothing to do."
+          fi
