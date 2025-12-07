@@ -1,0 +1,117 @@
+name: Update AUR Package
+
+on:
+  # 定时触发：每天 UTC 时间 0点 (北京时间 8点)
+  schedule:
+    - cron: '0 0 * * *'
+  # 允许手动触发
+  workflow_dispatch:
+
+jobs:
+  update-aur:
+    runs-on: ubuntu-latest
+    # 使用 Arch Linux 容器，包含构建工具
+    container: archlinux:base-devel
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        run: |
+          # 更新系统并安装 git (makepkg 需要)
+          pacman -Syu --noconfirm git openssh
+
+          # 修复 git 安全目录问题
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Prepare Builder User
+        # makepkg 不允许以 root 运行，我们需要创建一个 builder 用户
+        run: |
+          useradd -m builder
+          chown -R builder:builder .
+          # 给予 builder 用户无密码 sudo 权限 (如果构建过程中需要安装依赖)
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+      - name: Update pkgver and .SRCINFO
+        id: update
+        run: |
+          # 切换到 builder 用户执行更新逻辑
+          su builder -c "bash -e" << 'EOF'
+            # 1. 下载源文件 (只会克隆 git 仓库，不会构建)
+            makepkg --nobuild --source
+
+            # 2. 手动执行 PKGBUILD 中的 pkgver() 逻辑来获取最新版本号
+            # 注意：这里我们模拟进入 src 目录
+            source PKGBUILD
+            cd src/natmap-git
+            
+            # 提取版本号 (使用 PKGBUILD 中定义的逻辑)
+            NEW_VER=$(git describe --long --tags | sed 's/^v//;s/-/r/;s/-/./g')
+            echo "Latest version: $NEW_VER"
+            cd ../..
+
+            # 3. 使用 sed 更新 PKGBUILD 文件中的 pkgver
+            # 我们读取当前文件的 pkgver，如果不同则替换
+            OLD_VER=$(grep "^pkgver=" PKGBUILD | cut -d'=' -f2)
+            
+            if [ "$OLD_VER" != "$NEW_VER" ]; then
+              sed -i "s/^pkgver=.*/pkgver=$NEW_VER/" PKGBUILD
+              echo "Updated pkgver from $OLD_VER to $NEW_VER"
+              
+              # 4. 重新生成 .SRCINFO (AUR 必须)
+              makepkg --printsrcinfo > .SRCINFO
+              
+              # 标记发生了更新，供后续步骤使用
+              echo "UPDATED=true" >> $GITHUB_OUTPUT
+            else
+              echo "Version has not changed."
+              echo "UPDATED=false" >> $GITHUB_OUTPUT
+            fi
+          EOF
+
+      - name: Setup SSH
+        if: steps.update.outputs.UPDATED == 'true'
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # 添加 AUR 的 host key 到 known_hosts
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+
+      - name: Push to AUR
+        if: steps.update.outputs.UPDATED == 'true'
+        run: |
+          # 配置 git 信息
+          git config --global user.name "${{ secrets.AUR_USERNAME || 'github-actions' }}"
+          git config --global user.email "${{ secrets.AUR_EMAIL || 'github-actions@github.com' }}"
+
+          # 克隆 AUR 仓库
+          # 注意：这里的仓库名必须和你的包名一致
+          git clone "ssh://aur@aur.archlinux.org/natmap-git.git" aur-repo
+
+          # 复制更新后的文件到 AUR 仓库目录
+          cp PKGBUILD .SRCINFO aur-repo/
+
+          # 提交并推送
+          cd aur-repo
+          if [[ -n $(git status -s) ]]; then
+            git add PKGBUILD .SRCINFO
+            git commit -m "Update to version $(grep '^pkgver=' PKGBUILD | cut -d'=' -f2)"
+            git push origin master
+            echo "Successfully pushed to AUR."
+          else
+            echo "No changes to commit."
+          fi
+          
+      - name: Commit back to GitHub (Optional)
+        if: steps.update.outputs.UPDATED == 'true'
+        run: |
+          # 如果你也想把更新后的 PKGBUILD 同步回当前的 GitHub 仓库
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Auto update pkgver" || echo "Nothing to commit"
+          git push
