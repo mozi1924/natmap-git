@@ -57,32 +57,25 @@ jobs:
       - name: Update PKGBUILD and .SRCINFO
         working-directory: ./workspace
         run: |
-          # 配置 git 信息
+          # 配置 git 信息 (用于提交)
           git config --global user.name "${{ secrets.AUR_USERNAME }}"
           git config --global user.email "${{ secrets.AUR_EMAIL }}"
           
-          # 标记目录安全以允许 builder 操作
+          # 标记当前目录安全
           git config --global --add safe.directory $(pwd)
 
           echo "Fetching upstream changes..."
-          # 切换到 builder 用户运行 makepkg
-          # --nobuild: 仅下载源文件并解压，不编译
-          # 这会触发 git clone https://github.com/heiher/natmap 到 src/natmap
-          su builder -c "makepkg --nobuild --source"
+          # 修正点：去掉 --source，只使用 --nobuild 来下载并解压源码
+          su builder -c "makepkg --nobuild"
 
           echo "Calculating new version..."
-          # 进入源码目录，利用 git describe 获取最新版本号
-          # 注意：这里的路径 src/natmap-git 对应 PKGBUILD 中的 source 命名
-          cd src/natmap-git
+          # 修正点：使用 builder 用户进入目录执行 git describe，避免 root/builder 权限导致的 git safe directory 报错
+          # 注意：路径 src/natmap-git 是由 PKGBUILD 中的 source 数组决定的
+          NEW_VER=$(su builder -c "cd src/natmap-git && git describe --long --tags | sed 's/^v//;s/-/r/;s/-/./g'")
           
-          # 执行 PKGBUILD 中定义的 pkgver() 逻辑
-          NEW_VER=$(git describe --long --tags | sed 's/^v//;s/-/r/;s/-/./g')
           echo "New version detected: $NEW_VER"
           
-          # 回到 PKGBUILD 所在目录
-          cd ../..
-          
-          # 获取旧版本号用于对比
+          # 获取旧版本号
           OLD_VER=$(grep "^pkgver=" PKGBUILD | cut -d= -f2)
           
           if [ "$NEW_VER" == "$OLD_VER" ]; then
@@ -92,10 +85,10 @@ jobs:
           fi
           
           echo "Updating PKGBUILD..."
-          # 使用 sed 更新 PKGBUILD 中的 pkgver
+          # 更新 PKGBUILD 中的 pkgver
           sed -i "s/^pkgver=.*/pkgver=$NEW_VER/" PKGBUILD
           
-          # 更新 pkgrel (通常版本号变了，rel 重置为 1)
+          # 更新 pkgrel 为 1
           sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
 
           echo "Generating .SRCINFO..."
